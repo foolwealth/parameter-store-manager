@@ -1,0 +1,182 @@
+#! /usr/bin/env python
+from __future__ import print_function, absolute_import
+import botocore.exceptions
+import boto3, click, json
+import sys, tempfile, os, yaml
+from subprocess import call
+    
+ssm = boto3.client('ssm')
+kms = boto3.client('kms')
+
+@click.group()
+def cli():
+    pass
+
+@cli.command()
+@click.argument('environment')
+@click.argument('application')
+@click.argument('new_environment')
+
+
+def copy(environment, application, new_environment):
+    _create_new_kms_key(new_environment, application)
+    sys.exit()
+
+    kms_key_arn = _get_kms_key_arn(environment, application)
+    new_kms_key_arn = _get_kms_key_arn(new_environment, application)
+
+    param_path = "/{}/{}".format(environment.lower(), application.lower())
+    new_param_path = "/{}/{}".format(new_environment.lower(), application.lower())
+
+    params = _get_parameters(param_path)
+    edited_params = _edit_parameters(params, param_path)
+    _save_changes(params, edited_params, new_param_path, new_kms_key_arn)
+
+def _get_kms_key_arn(environment, application):
+    candidates = []
+    keys_resp = kms.list_keys(Limit=1000)
+
+    for key in keys_resp['Keys']:
+        try:
+            tags_resp = kms.list_resource_tags(KeyId=key['KeyId'])
+        except botocore.exceptions.ClientError as err:
+            if "AccessDeniedException" in err.message:
+                continue
+            else:
+                raise
+    
+        env_match = False
+        app_match = False
+        for tag in tags_resp['Tags']:
+            if not env_match and tag['TagKey'].lower() == 'environment':
+                env_match = tag['TagValue'].lower() == environment.lower()
+            if not app_match and tag['TagKey'].lower() == 'application':
+                app_match = tag['TagValue'].lower() == application.lower()
+
+        if env_match and app_match:
+            candidates.append(key)
+
+    if len(candidates) == 0:
+        raise click.ClickException(
+            "No accessible KMS Master Key found tagged with "
+            "Environment:{} and Application:{}!".format(environment, application)
+        )
+    elif len(candidates) > 1:
+        raise click.ClickException(
+            "Multiple KMS Master Keys found tagged with "
+            "Environment:{} and Application:{}!\n\n{}".format(
+                environment, application, [key['KeyId'] for key in candidates]
+            )
+        )
+    else:
+        return candidates[0]['KeyArn']
+
+def _create_new_kms_key(new_environment, application):
+    candidates = []
+    keys_resp = kms.list_keys(Limit=1000)
+
+    for key in keys_resp['Keys']:
+        try:
+            tags_resp = kms.list_resource_tags(KeyId=key['KeyId'])
+        except botocore.exceptions.ClientError as err:
+            if "AccessDeniedException" in err.message:
+                continue
+            else:
+                raise
+
+        env_match = False
+        app_match = False
+        for tag in tags_resp['Tags']:
+            if not env_match and tag['TagKey'].lower() == 'environment':
+                env_match = tag['TagValue'].lower() == new_environment.lower()
+            if not app_match and tag['TagKey'].lower() == 'application':
+                app_match = tag['TagValue'].lower() == application.lower()
+            #print("%s %s %s" % (tag['TagValue'].lower(), new_environment, env_match))
+
+        if env_match and app_match:
+            candidates.append(key)
+
+    if len(candidates) == 0:
+        print("Creating new KMS Key...")
+
+        new_kms_key_desc = "Key used for %s-%s AWS Parameter Store" % (new_environment, application)
+        create_key_resp = kms.create_key(
+            Description=new_kms_key_desc,
+            KeyUsage='ENCRYPT_DECRYPT',
+            Origin='AWS_KMS',
+            Tags=[
+                {
+                    'TagKey': 'Environment',
+                    'TagValue': new_environment
+                },
+                {
+                    'TagKey': 'Application',
+                    'TagValue': application
+                }
+            ]
+        )
+        new_kms_key_id = create_key_resp['KeyMetadata']['KeyId']
+        new_kms_alias = "alias/foolwealth-%s-%s" % (new_environment, application)
+        create_kms_alias_resp = kms.create_alias(
+                AliasName=new_kms_alias,
+                TargetKeyId=new_kms_key_id
+        )
+
+    elif len(candidates) > 1:
+        raise click.ClickException(
+            "Multiple KMS Master Keys found tagged with "
+            "Environment:{} and Application:{}!\n\n{}".format(
+                new_environment, application, [key['KeyId'] for key in candidates]
+            )
+        )
+    else:
+        print("New KMS Key already exists.")
+                
+def _get_parameters(path):
+    # we must retrieve the parameters in batches because the API won't return more than
+    # 10 at a time (and we don't know how many there are).
+    values = {}
+    next_token = None
+    while True:
+        # pass NextToken in kwargs because boto will get mad if you pass None.
+        kwargs = {} if next_token is None else {'NextToken': next_token}
+        params_resp = ssm.get_parameters_by_path(Path=path, WithDecryption=True, **kwargs)
+
+        for p in params_resp['Parameters']:
+            values[p['Name'].split('/')[-1]] = {
+                'type': p['Type'], 
+                'value': p['Value']
+            }
+
+        next_token = params_resp.get('NextToken')
+        if next_token is None:
+            break
+    
+    return values
+
+def _save_changes(orig_params, edited_params, new_path, kms_key_arn):
+    mod_cnt = 0
+
+    for key, spec in orig_params.items():
+        print("Creating {} ({})...".format(key, spec['type']))
+        _put_parameter(new_path, key, spec, kms_key_arn)
+        mod_cnt += 1
+
+    print("Done!")
+
+def _put_parameter(new_path, key, spec, kms_key_arn):
+    put_kwargs = {
+        'Name': os.path.join(new_path, key), 
+        'Value': spec['value'],
+        'Type': spec['type'],
+        'Overwrite': True
+    }
+
+    if spec['type'] == 'SecureString':
+        put_kwargs['KeyId'] = new_kms_key_arn
+
+    ssm.put_parameter(**put_kwargs)
+
+
+if __name__ == '__main__':
+    cli()
